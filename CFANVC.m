@@ -3,9 +3,9 @@
 % Code for the work:
 % Paulo A. C. Lopes, José A. B. Gerald
 % Careful Feedback Active Noise and Vibration Control Algorithm Robust to Large Secondary Path Changes
-% Transaction on Signal processing, to be published.
+% European Control Journal, to be published.
 % 
-% Paulo Alexandre Crisóstomo Lopes, 13 January 2023
+% Paulo Alexandre Crisóstomo Lopes, 26 June 2023
 % Instituto de Engenharia de Sistemas e Computadores - Investigação e Desenvolvimento
 % Instituto Superior Técnico
 % Universidade de Lisboa
@@ -17,7 +17,7 @@ simulation_time = 10*fs;    % simulation samples
 change_at = simulation_time/2;
 change_time = 1*fs;         % 1s fast
 qn_steady = 0*1/400/fs;     % state noise
-qn_change = 2/change_time;  % state noise at change
+qn_change = 2/change_time;  % relative state noise at change
 
 stability_margin = 0.1;     % distance of model poles and zeros from the unit circle
 f = 200*(1:3)';             % primary noise sinusoids frequencies
@@ -31,25 +31,28 @@ qv0 = 0.01;                 % background noise power
 
 % algorithm parameters
 N = 15;                     % model order (size-1)
-L = 64;                     % MPC horizont length
+L = 64;                     % the equations are 2*L, from i = -L+1 to L
 M = 32*(N+1);               % algorithm memory
 P = M;                      % size of qv estimation blocks
-R = N;                      % size of qv estimation blocks
+R = N;                      % number of samples used to obtain uM
 Lu = 10;                    % saturation of the antinoise signal
-wd = 10000;                 % keep past control signals constant
-wu = 1e-6;                  % effort weigth on control signal u
-deltax = 1e-3;              % prior 1/sigma^2 pior of a and b (x)
+wd = 10000;                 % cost weigth of past control signal changes
+wu = 0;                     % cost weigth of control effort
+deltax = 1e-3;              % prior on x variance
 delta = 1e-9;               % actual value added Rxx to calc Sxx (<deltax)
 alpha = 0;                  % controls auxiliary noise power
-eta = 1.01;                 % max grouth rate of u (per sin half period)
-Q = 8;                      % control signal update interval
+eta = 1.01;                 % max grouth rate of u (per Q samples)
+Q = 8;                      % controller update period
 
-% Signal logs
+% LOGS
 log_e = nan*zeros(simulation_time, Nsim);
 log_u = nan*zeros(simulation_time, Nsim);
 log_xi = nan*zeros(simulation_time, Nsim);
 log_xi0 = nan*zeros(simulation_time, Nsim);
 log_qv = nan*zeros(simulation_time, Nsim);
+
+% warning('off', 'MATLAB:singularMatrix');
+% warning('off', 'MATLAB:nearlySingularMatrix');
 
 for n_sim = 1:Nsim
     tic
@@ -66,18 +69,31 @@ for n_sim = 1:Nsim
     uv = zeros(max(M+N+1, 2*L), 1);        % anti-noise buffer
     e1v = zeros(Nx+1, 1);    % residual noise minus background noise buffer
 
+    % good values for ah and bh
+    n = 0:N-length(a)+1;
+    Pz = exp(2*pi*f/fs*n*1i);
+    Pz = [real(Pz); imag(Pz)];
+    Hz = exp(-2*pi*f*n/fs*1i)*Pz.';
+    Hz = [real(Hz); imag(Hz)];
+    Az = Hz\[ones(length(f),1); zeros(length(f),1)];
+    pz = - Pz.'*Az; pz(1) = pz(1) + 1;
+    pz = pz/pz(1);
+
     % algorithm initialization
     u = 0;                   % anti-noise signal
     ev = zeros(M+N,1);       % residual noise buffer
     wuv = wu*ones(L+N,1);
-    wev = ones(L,1);
+    wev = ones(L,1);         % cost weigth of each residual noise sample
+    bc = zeros(1,N);
+    ac = zeros(1,N);
+    udv = zeros(L+N,1);
 
     for k = 1:simulation_time
         
         % simulation
         qn = qn_steady + qn_change*(abs(k-change_at)<=change_time/2);
-        a(2:end) = a(2:end) + std(a(2:end))*sqrt(qn)*randn(Nx,1);
-        b = b + std(b)*sqrt(qn)*randn(Nx+1,1);
+        a(2:end) = a(2:end) + rms(a(2:end))*sqrt(qn)*randn(Nx,1);
+        b = b + rms(b)*sqrt(qn)*randn(Nx+1,1);
         if qn > 0
             [a,b] = adjust_plant(a,b,stability_margin);
         end
@@ -101,7 +117,7 @@ for n_sim = 1:Nsim
 
                 if mod(k, Q) == 0
 
-                    % Estimate the parameters
+                    % Calculate the parameters
                     Em = ev((1:M)'+(1:N));
                     Um = uv((0:M-1)'+(1:N+1));
                     H = [-Em, Um];
@@ -116,6 +132,10 @@ for n_sim = 1:Nsim
                     Delta = delta*eye(2*N+1);
                     Sxx = qvM*inv(Rxx + Delta);
                     
+                    % good values for ah and bh
+                    %a0 = conv(a,pz); a0 = a0(2:end); a0 = [a0; zeros(N-length(a0),1)];
+                    %b0 = conv(b,pz); b0 = [b0; zeros(N+1-length(b0),1)];
+            
                     Saa = Sxx(1:N, 1:N);
                     Saax = [zeros(N+1,1), [zeros(1,N); Saa]];
                     Sbb = Sxx(N+1:end, N+1:end);
@@ -127,8 +147,7 @@ for n_sim = 1:Nsim
                     Qaa = [1;ab]*[1;ab]' + Saax;
                     Qab = Qba';
 
-                    % Calculate the control signal
-                    Imx = diag([wev; zeros(N,1)]);
+                    Imx = diag([1./wev; zeros(N,1)]);
                     Raax = conv2(Imx, flip(flip(Qaa),2), 'valid');
                     RaaI = inv(Raax);
                     Raa = conv2(RaaI, Qaa);
@@ -140,23 +159,24 @@ for n_sim = 1:Nsim
                     Rmd = decomposition(Rbb + wd*Wm);
                     Bc = Rmd\Rba;
                     Ac = Rmd\Wm*wd;
+                    bc0 = bc; ac0 = ac;
                     bc = Bc(L, L+1:end);
                     ac = - Ac(L, L+1:end);
 
                     edv = zeros(L+N, 1);
                     edv(L+1:end) = ev(1:N);
                     u0v = [zeros(L,1); uv(1:N)];
+                    udv0 = udv;
                     udv = Bc*edv + Ac*u0v;
                     xi = edv'*Raa*edv + udv'*Rbb*udv - 2*udv'*Rba*edv;
                     xi0 = edv'*Raa*edv + u0v'*Rbb*u0v - 2*u0v'*Rba*edv;
                     qr = alpha*xi/trace(Rbb);
+                    uM = eta*max(abs(uv(1:R)));
                 end
-
-                u = udv(L-mod(k,Q));
-                % u = bc*ev(1:N) - ac*uv(1:N);
+                % u = udv0(L-mod(k,Q)-Q);
+                u = bc0*ev(1:N) - ac0*uv(1:N);
                 u = u + sqrt(qr)*randn;
                 u = min(Lu, max(-Lu,u));
-                uM = eta*max(abs(uv(1:R)));
                 u = min(uM, max(-uM,u));
 
                 log_qv(k,n_sim) = qvM;
@@ -178,15 +198,18 @@ for n_sim = 1:Nsim
     toc
 end
 
+warning('on', 'MATLAB:singularMatrix');
+warning('on', 'MATLAB:nearlySingularMatrix');
+
 figure(1)
 plot_xy_p3((0:size(log_e,1)-1)/fs, 10*log10(sline(log_e.^2,min(round(simulation_time/200),200))));
 set(gca, 'YLim', [-20,30]);
 xlabel('time (s)');
 ylabel('Noise (dB)');
 grid on;
-title('Residual noise versus time percentile plot');
+%title('Residual noise versus time percentile plot');
 
-ix = (1:min(Nsim,10)) + 0;
+ix = (1:min(Nsim,10))+0;
 figure(2)
 plot((0:size(log_e,1)-1)/fs, 10*log10(sline(log_e(:,ix).^2,min(round(simulation_time/200),200))));
 set(gca, 'YLim', [-20,30]);
@@ -194,28 +217,27 @@ xlabel('time (s)');
 ylabel('Noise (dB)');
 grid on;
 %legend('simulation 1', 'simulation 2', 'simulation 3');
-title('Residual noise versus time plot of 10 simulations');
-legend('1','2','3','4','5','6','7','8','9','10');
+%title('Residual noise versus time plot of 3 simulations');
+%legend('1','2','3','4','5','6','7','8','9','10');
 
 figure(3);
 histogram(10*log10(mean(log_e(end-simulation_time/10:end,:).^2)),[-25:0.5:0,inf]);
 xlabel('Noise Power (dB)');
-ylabel('Frequency');
+ylabel(['Frequency (out of ', num2str(Nsim),')']);
 grid on;
-title('Final residual noise power histogram');
+%title('Final residual noise power histogram');
 
 figure(4);
-plot_xy_p3((0:size(log_e,1)-1)/fs, 10*log10(sline(log_qv,100)));
+plot_xy_p3((0:size(log_qv,1)-1)/fs, 10*log10(sline(log_qv,100)));
 grid on;
 title('Model identification error signal');
 
-ix = 1:min(Nsim,10) + 0;
+ix = 1:min(Nsim,10);
 figure(5)
 plot((0:size(log_xi0,1)-1)/fs, 10*log10(sline(log_xi0(:,ix)/sum(wev), min(round(simulation_time/200),200))));
 hold on;
 plot((0:size(log_xi0,1)-1)/fs, 10*log10(sline(log_xi(:,ix)/sum(wev),min(round(simulation_time/200),200))));
 hold off;
-%set(gca, 'YLim', [-40,30]);
 xlabel('time (s)');
 ylabel('Noise (dB)');
 grid on;
